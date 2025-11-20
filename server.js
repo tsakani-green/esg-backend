@@ -11,15 +11,34 @@ import { EsgRun } from "./models/EsgRun.js";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
-// CORS – allow all in dev, or a specific origin in prod
-const allowedOrigin = process.env.FRONTEND_ORIGIN || "*";
+// Increase body size limit for file uploads (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// CORS configuration
+const allowedOrigins = process.env.FRONTEND_ORIGIN 
+  ? process.env.FRONTEND_ORIGIN.split(',').map(origin => origin.trim())
+  : ["https://esg-dashboard-pied.vercel.app", "http://localhost:3000", "http://localhost:5173", "*"];
+
 app.use(
   cors({
-    origin: allowedOrigin,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Not allowed by CORS: ${origin}`));
+      }
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// Handle preflight requests
+app.options("*", cors());
 
 const PORT = process.env.PORT || 5000;
 
@@ -329,6 +348,11 @@ async function generateInsightsFromOpenAI(systemPrompt, payload) {
 
 // ---------- Routes ----------
 
+// Health check endpoint
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
 // Main ESG data for dashboard
 app.get("/api/esg-data", async (req, res) => {
   try {
@@ -447,12 +471,63 @@ app.get("/api/governance-insights", async (req, res) => {
 });
 
 // ---------- Upload route (Excel OR JSON) ----------
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+  },
+});
 
-app.post("/api/esg-upload", upload.single("file"), async (req, res) => {
+app.post("/api/esg-upload", (req, res, next) => {
+  console.log('Upload endpoint hit:', {
+    method: req.method,
+    contentType: req.headers['content-type'],
+    contentLength: req.headers['content-length'],
+    origin: req.headers.origin,
+  });
+
+  upload.single("file")(req, res, (err) => {
+    if (err) {
+      console.error('Multer middleware error:', err);
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: 'File size too large. Maximum size is 50MB.' });
+        }
+        if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+          return res.status(400).json({ error: 'Unexpected file field. Expected field name: "file".' });
+        }
+        return res.status(400).json({ error: `Upload error: ${err.message}`, code: err.code });
+      }
+      return res.status(500).json({ error: 'Failed to process file upload.', details: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
+    console.log('Upload handler executed:', {
+      hasFile: !!req.file,
+      fileSize: req.file?.size,
+      fileName: req.file?.originalname,
+      contentType: req.headers['content-type'],
+      bodyKeys: Object.keys(req.body || {}),
+    });
+
     if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
+      console.error('No file in request:', {
+        files: req.files,
+        body: req.body,
+        headers: {
+          'content-type': req.headers['content-type'],
+          'content-length': req.headers['content-length'],
+        },
+      });
+      return res.status(400).json({ 
+        error: "No file uploaded. Please ensure the file field name is 'file' and Content-Type is multipart/form-data.",
+        received: {
+          bodyKeys: Object.keys(req.body || {}),
+          contentType: req.headers['content-type'],
+        }
+      });
     }
 
     const originalName = req.file.originalname.toLowerCase();
@@ -515,8 +590,27 @@ app.post("/api/esg-upload", upload.single("file"), async (req, res) => {
     });
   } catch (err) {
     console.error("Upload processing error:", err);
-    res.status(500).json({ error: "Failed to process ESG upload." });
+    console.error("Error stack:", err.stack);
+    res.status(500).json({ 
+      error: "Failed to process ESG upload.",
+      details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
+});
+
+// ---------- Global error handler ----------
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err);
+  console.error('Error stack:', err.stack);
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error',
+    details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+});
+
+// ---------- 404 handler ----------
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
 });
 
 // ---------- start server ----------
